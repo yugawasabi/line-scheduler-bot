@@ -35,39 +35,91 @@ async function handleMessage(event) {
   const userId = event.source.userId;
   const text = event.message.text.trim();
 
-  // 今日の予定
-  if (text.includes('今日')) {
-    await replySchedules(event.replyToken, userId, new Date(), new Date());
+  // ユーザーの状態取得
+  const stateDoc = await db.collection('user_states').doc(userId).get();
+  let state = stateDoc.exists ? stateDoc.data() : {};
+
+  // --------------------------
+  // (1) 対話中の編集・削除処理
+  // --------------------------
+  if (state.step === "waitingForNumber") {
+    // リスト番号を受け取る
+    const index = parseInt(text, 10);
+    if (isNaN(index) || index < 1) {
+      await client.replyMessage(event.replyToken, { type: 'text', text: '正しい番号を送ってください' });
+      return;
+    }
+
+    // 該当予定を取得
+    const snapshot = await db.collection('schedules')
+      .where('userId', '==', userId)
+      .orderBy('date')
+      .get();
+
+    if (index > snapshot.size) {
+      await client.replyMessage(event.replyToken, { type: 'text', text: '指定番号の予定が見つかりません。' });
+      return;
+    }
+
+    const doc = snapshot.docs[index - 1];
+    await db.collection('user_states').doc(userId).set({
+      targetScheduleId: doc.id,
+      step: "selectAction"
+    }, { merge: true });
+
+    await client.replyMessage(event.replyToken, { type: 'text', text: `予定「${doc.data().date} ${doc.data().time || ""} ${doc.data().content}」\n編集しますか？削除しますか？` });
     return;
   }
 
-  // 明日の予定
-  if (text.includes('明日')) {
-    const tomorrow = addDays(new Date(), 1);
-    await replySchedules(event.replyToken, userId, tomorrow, tomorrow);
+  if (state.step === "selectAction") {
+    const scheduleRef = db.collection('schedules').doc(state.targetScheduleId);
+    const scheduleDoc = await scheduleRef.get();
+    const data = scheduleDoc.data();
+
+    if (text === "編集") {
+      await db.collection('user_states').doc(userId).set({ currentAction: "editing", step: "waitingForField" }, { merge: true });
+      await client.replyMessage(event.replyToken, { type: 'text', text: '何を編集しますか？ 日付 / 時間 / 内容 を送ってください' });
+      return;
+    } else if (text === "削除") {
+      await scheduleRef.delete();
+      await db.collection('user_states').doc(userId).set({ currentAction: null, step: null, targetScheduleId: null }, { merge: true });
+      await client.replyMessage(event.replyToken, { type: 'text', text: `削除しました ✅\n📅 ${data.date}${data.time ? ' ' + data.time : ''}\n📝 ${data.content}` });
+      return;
+    } else {
+      await client.replyMessage(event.replyToken, { type: 'text', text: '「編集」か「削除」を送ってください' });
+      return;
+    }
+  }
+
+  if (state.step === "waitingForField" && state.currentAction === "editing") {
+    const scheduleRef = db.collection('schedules').doc(state.targetScheduleId);
+    const scheduleDoc = await scheduleRef.get();
+    const data = scheduleDoc.data();
+    let updateData = {};
+
+    // 日付変更
+    if (/^\d{1,2}[\/-]\d{1,2}$/.test(text) || /^\d{4}-\d{2}-\d{2}$/.test(text)) {
+      updateData.date = text;
+    }
+    // 時間変更
+    else if (/^\d{1,2}:\d{2}$/.test(text)) {
+      updateData.time = text;
+    }
+    // 内容変更
+    else {
+      updateData.content = text;
+    }
+
+    await scheduleRef.update(updateData);
+    await db.collection('user_states').doc(userId).set({ currentAction: null, step: null, targetScheduleId: null }, { merge: true });
+
+    await client.replyMessage(event.replyToken, { type: 'text', text: `変更を保存しました ✅\n📅 ${updateData.date || data.date}${updateData.time || data.time ? ' ' + (updateData.time || data.time) : ''}\n📝 ${updateData.content || data.content}` });
     return;
   }
 
-  // 「10月の予定」など月指定
-  const monthMatch = text.match(/(\d{1,2})月/);
-  if (monthMatch) {
-    const month = parseInt(monthMatch[1], 10) - 1;
-    const year = new Date().getFullYear();
-    const start = startOfMonth(new Date(year, month, 1));
-    const end = endOfMonth(new Date(year, month, 1));
-    await replySchedules(event.replyToken, userId, start, end);
-    return;
-  }
-
-  // 「①を削除」
-  const delMatch = text.match(/^(\d+)を削除$/);
-  if (delMatch) {
-    const index = parseInt(delMatch[1], 10);
-    await deleteSchedule(event.replyToken, userId, index);
-    return;
-  }
-
-  // 日付+内容の予定追加
+  // --------------------------
+  // (2) 予定の追加
+  // --------------------------
   const dateMatch = text.match(/(\d{1,2})[\/月](\d{1,2})\s*(\d{1,2}:\d{2})?\s*(.+)/);
   if (dateMatch) {
     const [, m, d, t, content] = dateMatch;
@@ -88,14 +140,35 @@ async function handleMessage(event) {
       createdAt: new Date().toISOString()
     });
 
-    await client.replyMessage(event.replyToken, {
-      type: 'text',
-      text: `予定を登録しました！\n📅 ${dateStr}${timeStr ? ' ' + timeStr : ''}\n📝 ${content}`
-    });
+    await client.replyMessage(event.replyToken, { type: 'text', text: `予定を登録しました！\n📅 ${dateStr}${timeStr ? ' ' + timeStr : ''}\n📝 ${content}` });
     return;
   }
 
+  // --------------------------
+  // (3) 今日・明日・月の予定リスト
+  // --------------------------
+  let startDate, endDate;
+
+  if (text.includes('今日')) startDate = endDate = new Date();
+  else if (text.includes('明日')) { startDate = endDate = addDays(new Date(), 1); }
+  else {
+    const monthMatch = text.match(/(\d{1,2})月/);
+    if (monthMatch) {
+      const month = parseInt(monthMatch[1], 10) - 1;
+      const year = new Date().getFullYear();
+      startDate = startOfMonth(new Date(year, month, 1));
+      endDate = endOfMonth(new Date(year, month, 1));
+    }
+  }
+
+  if (startDate && endDate) {
+    await replySchedules(event.replyToken, userId, startDate, endDate);
+    return;
+  }
+
+  // --------------------------
   // それ以外は無反応
+  // --------------------------
   return;
 }
 
@@ -108,6 +181,7 @@ async function replySchedules(replyToken, userId, startDate, endDate) {
     .where('userId', '==', userId)
     .where('date', '>=', start)
     .where('date', '<=', end)
+    .orderBy('date')
     .get();
 
   if (snapshot.empty) {
@@ -123,29 +197,16 @@ async function replySchedules(replyToken, userId, startDate, endDate) {
     i++;
   });
 
+  message += '\n番号を送って編集・削除したい予定を選択してください';
+
   await client.replyMessage(replyToken, { type: 'text', text: message });
-}
 
-// ===== 削除 =====
-async function deleteSchedule(replyToken, userId, index) {
-  const snapshot = await db.collection('schedules')
-    .where('userId', '==', userId)
-    .orderBy('date')
-    .get();
-
-  if (snapshot.empty || index < 1 || index > snapshot.size) {
-    await client.replyMessage(replyToken, { type: 'text', text: '指定番号の予定が見つかりません。' });
-    return;
-  }
-
-  const doc = snapshot.docs[index - 1];
-  const data = doc.data();
-  await doc.ref.delete();
-
-  await client.replyMessage(replyToken, {
-    type: 'text',
-    text: `削除しました ✅\n📅 ${data.date}${data.time ? ' ' + data.time : ''}\n📝 ${data.content}`
-  });
+  // ユーザー状態を更新
+  await db.collection('user_states').doc(userId).set({
+    step: "waitingForNumber",
+    targetScheduleId: null,
+    currentAction: null
+  }, { merge: true });
 }
 
 // ===== サーバー起動 =====
